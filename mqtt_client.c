@@ -8,6 +8,7 @@
 #include <linux/tcp.h>
 #include <signal.h>
 #include <pthread.h>
+#include <stdlib.h>
 
 #define LOGS(TAG, fmt, ...)          fprintf(stdout, "" fmt "\n", ##__VA_ARGS__)
 #define LOGT(TAG, fmt, ...)          fprintf(stdout, "\033[0m\033[42;33mI\033[0m/ %s" fmt " at %s:%u\n", TAG, ##__VA_ARGS__, __PRETTY_FUNCTION__, __LINE__)
@@ -89,10 +90,10 @@ int read_packet(int timeout, int socket_id, uint8_t *packet_buffer)
         else if (ret == 0) return 0;
         else {
             if (FD_ISSET(socket_id, &readfds)) {
-                LOGD(TAG, "FD SET[fd=%d], tmo=%d,%d", socket_id, tmv.tv_sec, tmv.tv_usec);
+                LOGD(TAG, "FD SET[fd=%d], tmo=%d,%d", socket_id, (int)tmv.tv_sec, (int)tmv.tv_usec);
                 goto L_READ;
             } else {
-                LOGD(TAG, "FD NOT SET, tmo=%d,%d", tmv.tv_sec, tmv.tv_usec);
+                LOGW(TAG, "FD NOT SET, tmo=%d,%d", (int)tmv.tv_sec, (int)tmv.tv_usec);
                 goto L_SELECT;
             }
         }
@@ -154,22 +155,25 @@ int mqtt_cli_publish()
 
     packet_length = read_packet(1, socket_id, packet_buffer);
 	if (packet_length < 0) {
-		fprintf(stderr, "Error(%d) on read packet!\n", packet_length);
+		LOGE(TAG, "Error(%d) on read packet!", packet_length);
 		return -1;
 	}
 
     if (MQTTParseMessageType(packet_buffer) != MQTT_MSG_CONNACK) {
-		fprintf(stderr, "CONNACK expected!\n");
+		LOGE(TAG, "CONNACK expected!");
 		return -1;
 	}
 
 	if (packet_buffer[3] != 0x00) {
-		fprintf(stderr, "CONNACK failed!\n");
+		LOGE(TAG, "CONNACK failed!");
 		return -1;
 	}
 
     LOGT(TAG, "Publish: QoS 2");
-	mqtt_publish_with_qos(&broker, "mqtt_test_topic", "Example: QoS 2", 1, 2, &msg_id); // Retain
+    char msg[64];
+    static int cnt = 0;
+    snprintf(msg, sizeof(msg), "msg Qos2. cnt_%d", ++cnt);
+	mqtt_publish_with_qos(&broker, "mqtt_test_topic", msg, 1, 2, &msg_id); // Retain
 	packet_length = read_packet(1, socket_id, packet_buffer);
 	if (packet_length < 0) {
 		LOGE(TAG, "Error(%d) on read packet", packet_length);
@@ -212,7 +216,7 @@ int mqtt_cli_publish()
 
 void alive(int sig)
 {
-	printf("Timeout! Sending ping...\n");
+	LOGT(TAG, "Timeout! Sending ping...");
 	mqtt_ping(&sub_broker);
 
 	alarm(30);
@@ -220,8 +224,7 @@ void alive(int sig)
 
 void term(int sig)
 {
-	printf("Goodbye!\n");
-	// >>>>> DISCONNECT
+	LOGT(TAG, "Goodbye!");
 	mqtt_disconnect(&sub_broker);
 	close_socket(&sub_broker);
 
@@ -233,11 +236,13 @@ static void* __subscribe_task(void *arg)
     int socket_id = (int)arg;
     int packet_length;
     uint8_t packet_buffer[RCVBUFSIZE];
+    int recv_cnt = 0;
+
+    LOGW(TAG, "fd=%d", socket_id);
     while (1) {
-        packet_length = read_packet(1, socket_id, packet_buffer);
+        packet_length = read_packet(0, socket_id, packet_buffer);
 		if (packet_length == -1) {
 			LOGE(TAG, "Error(%d) on read packet!", packet_length);
-			return -1;
 		} else if(packet_length > 0) {
 			LOGD(TAG, "Packet Header: 0x%x...", packet_buffer[0]);
 			if (MQTTParseMessageType(packet_buffer) == MQTT_MSG_PUBLISH) {
@@ -247,7 +252,7 @@ static void* __subscribe_task(void *arg)
 				topic[len] = '\0'; // for printf
 				len = mqtt_parse_publish_msg(packet_buffer, msg);
 				msg[len] = '\0'; // for printf
-				LOGT(TAG, "%s %s", topic, msg);
+				LOGT(TAG, "[%d] %s %s", ++recv_cnt, topic, msg);
 			}
 		}
     }
@@ -267,19 +272,21 @@ static int __subscribe_init()
     init_socket(&sub_broker, "10.37.129.2", 1883, &socket_id, 30);
     mqtt_connect(&sub_broker);
 
+    LOGW(TAG, "sub sock=%d", socket_id);
+
     packet_length = read_packet(1, socket_id, packet_buffer);
 	if (packet_length < 0) {
-		fprintf(stderr, "Error(%d) on read packet!\n", packet_length);
+		LOGE(TAG, "Error(%d) on read packet!", packet_length);
 		return -1;
 	}
 
     if (MQTTParseMessageType(packet_buffer) != MQTT_MSG_CONNACK) {
-		fprintf(stderr, "CONNACK expected!\n");
+		LOGE(TAG, "CONNACK expected!");
 		return -1;
 	}
 
 	if (packet_buffer[3] != 0x00) {
-		fprintf(stderr, "CONNACK failed!\n");
+		LOGE(TAG, "CONNACK failed!");
 		return -1;
 	}
 
@@ -308,6 +315,7 @@ static int __subscribe_init()
     pthread_create(&pid, NULL, __subscribe_task, (void *)socket_id);
     pthread_detach(pid);
 
+    usleep(1000 * 1000 * 2);
     return 0;
 }
 
@@ -320,7 +328,7 @@ int main()
     while (1) {
         LOGD(TAG, "===================count=%d", ++count);
         mqtt_cli_publish();
-        usleep(1000 * 1000);
+        usleep(1000 * 50);
     }
 
     return 0;
