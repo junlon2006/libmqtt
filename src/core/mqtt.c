@@ -9,6 +9,10 @@
 #define MQTT_CONNECT     1
 #define MQTT_CONNACK     2
 #define MQTT_PUBLISH     3
+#define MQTT_PUBACK      4
+#define MQTT_PUBREC      5
+#define MQTT_PUBREL      6
+#define MQTT_PUBCOMP     7
 #define MQTT_SUBSCRIBE   8
 #define MQTT_SUBACK      9
 #define MQTT_PINGREQ     12
@@ -168,6 +172,38 @@ static int pack_disconnect(uint8_t* buf) {
     buf[0] = MQTT_DISCONNECT << 4;
     buf[1] = 0;
     return 2;
+}
+
+static int pack_puback(uint8_t* buf, uint16_t packet_id) {
+    buf[0] = MQTT_PUBACK << 4;
+    buf[1] = 2;
+    buf[2] = packet_id >> 8;
+    buf[3] = packet_id & 0xFF;
+    return 4;
+}
+
+static int pack_pubrec(uint8_t* buf, uint16_t packet_id) {
+    buf[0] = MQTT_PUBREC << 4;
+    buf[1] = 2;
+    buf[2] = packet_id >> 8;
+    buf[3] = packet_id & 0xFF;
+    return 4;
+}
+
+static int pack_pubrel(uint8_t* buf, uint16_t packet_id) {
+    buf[0] = (MQTT_PUBREL << 4) | 0x02;
+    buf[1] = 2;
+    buf[2] = packet_id >> 8;
+    buf[3] = packet_id & 0xFF;
+    return 4;
+}
+
+static int pack_pubcomp(uint8_t* buf, uint16_t packet_id) {
+    buf[0] = MQTT_PUBCOMP << 4;
+    buf[1] = 2;
+    buf[2] = packet_id >> 8;
+    buf[3] = packet_id & 0xFF;
+    return 4;
 }
 
 mqtt_client_t* mqtt_client_create(const mqtt_config_t* config) {
@@ -382,7 +418,8 @@ static int mqtt_send_ping(mqtt_client_t* client) {
 }
 
 static void mqtt_handle_publish(mqtt_client_t* client, int len) {
-    if (!client->config.msg_cb) return;
+    const mqtt_net_api_t* net = mqtt_net_get();
+    const mqtt_os_api_t* os = mqtt_os_get();
     
     size_t remaining;
     int offset = 1 + decode_remaining_length(client->recv_buf + 1, &remaining);
@@ -398,10 +435,26 @@ static void mqtt_handle_publish(mqtt_client_t* client, int len) {
     offset += topic_len;
     
     uint8_t qos = (client->recv_buf[0] >> 1) & 0x03;
-    if (qos > 0) offset += 2;
+    uint16_t packet_id = 0;
+    if (qos > 0) {
+        packet_id = (client->recv_buf[offset] << 8) | client->recv_buf[offset + 1];
+        offset += 2;
+    }
     
     size_t payload_len = len - offset;
-    client->config.msg_cb(topic, client->recv_buf + offset, payload_len, client->config.user_data);
+    if (client->config.msg_cb) {
+        client->config.msg_cb(topic, client->recv_buf + offset, payload_len, client->config.user_data);
+    }
+    
+    os->mutex_lock(client->mutex);
+    if (qos == 1) {
+        int pkt_len = pack_puback(client->send_buf, packet_id);
+        net->send(client->socket, client->send_buf, pkt_len);
+    } else if (qos == 2) {
+        int pkt_len = pack_pubrec(client->send_buf, packet_id);
+        net->send(client->socket, client->send_buf, pkt_len);
+    }
+    os->mutex_unlock(client->mutex);
 }
 
 static void mqtt_recv_thread(void* arg) {
@@ -445,6 +498,14 @@ static void mqtt_recv_thread(void* arg) {
         
         if (type == MQTT_PUBLISH) {
             mqtt_handle_publish(client, len);
+        } else if (type == MQTT_PUBREL) {
+            if (len >= 4) {
+                uint16_t packet_id = (client->recv_buf[2] << 8) | client->recv_buf[3];
+                os->mutex_lock(client->mutex);
+                int pkt_len = pack_pubcomp(client->send_buf, packet_id);
+                net->send(client->socket, client->send_buf, pkt_len);
+                os->mutex_unlock(client->mutex);
+            }
         }
     }
     
